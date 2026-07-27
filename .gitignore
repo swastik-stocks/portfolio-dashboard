@@ -1,0 +1,21 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Local database — contains real holdings/account data, never commit
+portfolio.db
+portfolio.db-journal
+
+# Raw broker exports — sensitive PII (PAN, account numbers), never commit
+*.xlsx
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
