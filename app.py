@@ -14,7 +14,6 @@ personal data), (2) DeepSeek analysis calls IF you click "Analyze" on
 a stock (sends only the ticker + company name, nothing else).
 """
 
-import os
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -136,24 +135,6 @@ with st.sidebar:
 
 # ── Main ──────────────────────────────────────────────────────────────────
 st.title("📊 Portfolio Dashboard")
-
-with st.expander("🔧 DIAGNOSTIC (temporary -- remove once things work)"):
-    st.write("**Environment variables (os.getenv) -- presence only, not values:**")
-    st.write(f"- TURSO_DATABASE_URL set: {bool(os.getenv('TURSO_DATABASE_URL'))}")
-    st.write(f"- TURSO_AUTH_TOKEN set: {bool(os.getenv('TURSO_AUTH_TOKEN'))}")
-    st.write(f"- DEEPSEEK_API_KEY set: {bool(os.getenv('DEEPSEEK_API_KEY'))}")
-    st.write("**st.secrets (Streamlit's own secrets store):**")
-    try:
-        st.write(f"- 'auth' section present: {'auth' in st.secrets}")
-        if 'auth' in st.secrets:
-            st.write(f"- auth.username set: {bool(st.secrets['auth'].get('username'))}")
-        st.write(f"- Root-level TURSO_DATABASE_URL in st.secrets: {'TURSO_DATABASE_URL' in st.secrets}")
-        st.write(f"- Root-level DEEPSEEK_API_KEY in st.secrets: {'DEEPSEEK_API_KEY' in st.secrets}")
-    except Exception as e:
-        st.write(f"Error reading st.secrets: {e}")
-    st.write("**db.py module-level (what it actually loaded at import time):**")
-    import db as _db_module
-    st.write(f"- db.TURSO_URL is set: {bool(_db_module.TURSO_URL)}")
 
 lots = get_all_lots()
 if not lots:
