@@ -65,6 +65,43 @@ def init_db():
             notes TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_cache (
+            symbol TEXT PRIMARY KEY,
+            verdict TEXT,
+            fundamental_score REAL,
+            news_sentiment INTEGER,
+            data_completeness TEXT,
+            computed_at TEXT
+        )
+    """)
+    conn.commit()
+    _sync_if_remote(conn)
+    conn.close()
+
+
+def get_signal_cache() -> dict:
+    """{symbol: {verdict, fundamental_score, news_sentiment, data_completeness, computed_at}}"""
+    conn = get_conn()
+    cursor = conn.execute("SELECT * FROM signal_cache")
+    rows = _rows_to_dicts(cursor)
+    conn.close()
+    return {r["symbol"]: r for r in rows}
+
+
+def save_signal_cache(symbol: str, verdict: str, fundamental_score: float,
+                       news_sentiment: int, data_completeness: str, computed_at: str):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO signal_cache (symbol, verdict, fundamental_score, news_sentiment, data_completeness, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(symbol) DO UPDATE SET
+            verdict=excluded.verdict,
+            fundamental_score=excluded.fundamental_score,
+            news_sentiment=excluded.news_sentiment,
+            data_completeness=excluded.data_completeness,
+            computed_at=excluded.computed_at
+    """, (symbol, verdict, fundamental_score, news_sentiment, data_completeness, computed_at))
     conn.commit()
     _sync_if_remote(conn)
     conn.close()

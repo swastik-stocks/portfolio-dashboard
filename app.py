@@ -19,10 +19,12 @@ import pandas as pd
 from datetime import datetime
 
 from auth import check_password
-from db import init_db, add_holding, update_holding, delete_holding, get_all_lots, get_consolidated, get_accounts
+from db import (init_db, add_holding, update_holding, delete_holding, get_all_lots,
+                 get_consolidated, get_accounts, get_signal_cache, save_signal_cache)
 from price_fetcher import get_live_prices
 from deepseek_client import get_analysis, is_configured as deepseek_configured
 from signal_engine import VERDICT_COLOR
+from quick_signal import compute_quick_signal
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
@@ -46,7 +48,17 @@ def pct(x: float) -> str:
     return f"{sign}{x:.2f}%"
 
 
-def build_view(rows: list, prices: dict) -> pd.DataFrame:
+VERDICT_EMOJI = {
+    "ADD": "🟢 ADD",
+    "HOLD": "🟡 HOLD",
+    "TRIM": "🟠 TRIM",
+    "STRONG TRIM": "🔴 STRONG TRIM",
+    "REVIEW": "⚪ REVIEW",
+}
+
+
+def build_view(rows: list, prices: dict, signal_cache: dict = None) -> pd.DataFrame:
+    signal_cache = signal_cache or {}
     out = []
     for r in rows:
         ltp = prices.get(r["symbol"])
@@ -54,8 +66,13 @@ def build_view(rows: list, prices: dict) -> pd.DataFrame:
         current_value = ltp * r["qty"] if ltp is not None else None
         pnl = (current_value - invested) if current_value is not None else None
         pnl_pct = (pnl / invested * 100) if pnl is not None and invested else None
+
+        cached = signal_cache.get(r["symbol"])
+        signal_display = VERDICT_EMOJI.get(cached["verdict"], "—") if cached else "— (not run)"
+
         out.append({
             "id": r.get("id"),
+            "Signal": signal_display,
             "Symbol": r["symbol"],
             "Name": r.get("company_name", ""),
             "Account(s)": ", ".join(r["accounts"]) if "accounts" in r else r.get("account", ""),
@@ -141,11 +158,18 @@ if not lots:
     st.info("No holdings yet. Add your first position using the sidebar.")
     st.stop()
 
-def render_analysis_result(result):
+def render_analysis_result(result, symbol: str = None):
     """Shared rendering for the DeepSeek analysis: verdict badge first
     (the computed decision, big and colored), then the narrative
-    explaining it, then the fully auditable grounded data underneath."""
+    explaining it, then the fully auditable grounded data underneath.
+    Also updates signal_cache for this symbol with the fresh verdict
+    just computed, so the main table's badge reflects it immediately
+    without needing a full "Refresh Signals" pass."""
     sig = result["signal"]
+    if symbol:
+        save_signal_cache(symbol, sig.verdict, sig.fundamental_score,
+                          sig.news_sentiment, sig.data_completeness,
+                          datetime.now().isoformat())
     color = VERDICT_COLOR.get(sig.verdict, "#8FA3B8")
     completeness_note = "" if sig.data_completeness == "FULL" else f" &nbsp; \u26a0\ufe0f {sig.data_completeness} DATA"
     st.markdown(
@@ -171,8 +195,9 @@ def render_analysis_result(result):
 
 view_mode = st.radio("View", ["Consolidated (across all accounts)", "By Account"], horizontal=True)
 
-col_refresh, col_time = st.columns([1, 4])
+col_refresh, col_signals, col_time = st.columns([1, 1, 3])
 force_refresh = col_refresh.button("🔄 Refresh Prices")
+refresh_signals_clicked = col_signals.button("🚦 Refresh Signals")
 
 all_symbols = sorted(set(l["symbol"] for l in lots))
 with st.spinner("Fetching live prices..."):
@@ -185,12 +210,45 @@ if missing_prices:
     st.warning(f"Couldn't fetch live price for: {', '.join(missing_prices)}. "
                f"Check the ticker is correct, or market may be closed with no cached data yet.")
 
+# ── Refresh Signals: computes ADD/HOLD/TRIM for every holding at once ────
+# Deterministic only (no DeepSeek call) -- see quick_signal.py. Rate-limited
+# by fundamentals.py's polite Screener.in delay, so this takes roughly
+# 2 seconds per unique symbol -- a manual action, not run on every render.
+if refresh_signals_clicked:
+    consolidated_for_signals = get_consolidated()
+    progress = st.progress(0.0, text="Refreshing signals...")
+    for i, r in enumerate(consolidated_for_signals):
+        symbol = r["symbol"]
+        ltp = prices.get(symbol)
+        invested = r["total_invested"]
+        pnl = (ltp * r["qty"] - invested) if ltp is not None else None
+        pnl_pct = (pnl / invested * 100) if pnl is not None and invested else None
+        position = {"qty": r["qty"], "avg_price": r["avg_price"], "ltp": ltp,
+                    "pnl": pnl, "pnl_pct": pnl_pct}
+        progress.progress((i) / len(consolidated_for_signals),
+                          text=f"Refreshing signals... {symbol} ({i+1}/{len(consolidated_for_signals)})")
+        sig = compute_quick_signal(symbol, r["company_name"], position=position)
+        save_signal_cache(symbol, sig.verdict, sig.fundamental_score,
+                          sig.news_sentiment, sig.data_completeness,
+                          datetime.now().isoformat())
+    progress.progress(1.0, text="Signals refreshed.")
+    st.rerun()
+
+signal_cache = get_signal_cache()
+if signal_cache:
+    oldest = min(signal_cache.values(), key=lambda r: r["computed_at"])
+    st.caption(f"Signals last refreshed: {oldest['computed_at'][:16].replace('T', ' ')} "
+               f"(click 🚦 Refresh Signals above to update)")
+else:
+    st.info("No signals computed yet — click 🚦 Refresh Signals above to see ADD/HOLD/TRIM "
+            "verdicts for all your holdings at once.")
+
 # ── Build the table depending on view mode ──────────────────────────────
 if view_mode.startswith("Consolidated"):
     rows = get_consolidated()
-    df = build_view(rows, prices)
+    df = build_view(rows, prices, signal_cache)
 else:
-    df = build_view(lots, prices)
+    df = build_view(lots, prices, signal_cache)
 
 # ── Summary metrics ──────────────────────────────────────────────────────
 total_invested = df["Invested"].sum()
@@ -241,13 +299,29 @@ if not view_mode.startswith("Consolidated"):
                 with st.spinner("Fetching fundamentals + news + analyzing..."):
                     result = get_analysis(lot["symbol"], lot["company_name"], position=position)
                 if result:
-                    render_analysis_result(result)
+                    render_analysis_result(result, symbol=lot["symbol"])
                 else:
                     st.error("Analysis unavailable — check DEEPSEEK_API_KEY in .env, or Screener.in fetch failed")
 else:
     st.subheader("Per-Stock Analysis")
     consolidated = get_consolidated()
-    symbol_choice = st.selectbox("Select a stock", [r["symbol"] for r in consolidated])
+    # Sort so TRIM/STRONG TRIM/REVIEW stocks surface first -- these are the
+    # ones actually worth spending a DeepSeek call to dig into.
+    verdict_priority = {"STRONG TRIM": 0, "TRIM": 1, "REVIEW": 2, "HOLD": 3, "ADD": 4}
+    def _sort_key(r):
+        cached = signal_cache.get(r["symbol"])
+        v = cached["verdict"] if cached else "REVIEW"
+        return verdict_priority.get(v, 5)
+    consolidated_sorted = sorted(consolidated, key=_sort_key)
+
+    def _label(r):
+        cached = signal_cache.get(r["symbol"])
+        badge = VERDICT_EMOJI.get(cached["verdict"], "") if cached else "(no signal yet)"
+        return f"{badge}  {r['symbol']}"
+
+    symbol_labels = [_label(r) for r in consolidated_sorted]
+    chosen_label = st.selectbox("Select a stock (worst signals shown first)", symbol_labels)
+    symbol_choice = consolidated_sorted[symbol_labels.index(chosen_label)]["symbol"]
     if st.button("Analyze (DeepSeek)", disabled=not deepseek_configured()):
         chosen = next(r for r in consolidated if r["symbol"] == symbol_choice)
         ltp = prices.get(chosen["symbol"])
@@ -259,7 +333,7 @@ else:
         with st.spinner("Fetching fundamentals + news + analyzing..."):
             result = get_analysis(chosen["symbol"], chosen["company_name"], position=position)
         if result:
-            render_analysis_result(result)
+            render_analysis_result(result, symbol=chosen["symbol"])
         else:
             st.error("Analysis unavailable — check DEEPSEEK_API_KEY in .env, or Screener.in fetch failed")
 
