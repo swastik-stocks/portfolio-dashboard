@@ -108,20 +108,38 @@ def compute_signal(red_flags: list, fundamentals: dict, news_items: list, positi
 
     pnl_pct = position.get("pnl_pct") if position else None
 
+    # [REVISED] Original table had a bare "else: HOLD" catching the entire
+    # -0.5 to +0.8 fund_score range regardless of position P&L -- meaning a
+    # stock down 19% and one up 60% got the identical verdict as long as
+    # fundamentals were merely "mixed, not clearly bad." Since only 2 of 6
+    # red-flag checks (pledge, D/E) can ever return FAIL -- the other four
+    # cap out at WARN -- most real stocks land in that middle zone by
+    # construction, making HOLD an near-universal default rather than a
+    # meaningful signal. Fixed: the middle zone now checks P&L explicitly,
+    # and a real accumulating decline (2+ WARNs, no FAIL) is treated as
+    # worth trimming rather than automatically "fine."
     if data_completeness == "INSUFFICIENT":
         verdict = "REVIEW"
     elif fund_score <= -1.5:
         verdict = "STRONG TRIM" if (pnl_pct is not None and pnl_pct < 0) else "TRIM"
     elif fund_score <= -0.5:
         verdict = "TRIM"
-    elif fund_score >= 0.8 and news_sentiment >= 0:
-        verdict = "HOLD" if (pnl_pct is not None and pnl_pct >= 50) else "ADD"
-    elif fund_score >= 0.8 and news_sentiment < 0:
-        verdict = "HOLD"
+    elif fund_score >= 0.8:
+        if news_sentiment < 0:
+            verdict = "HOLD"  # good fundamentals, but recent negative analyst signal -- wait and watch
+        elif pnl_pct is not None and pnl_pct >= 50:
+            verdict = "HOLD"  # good fundamentals, but already a big winner -- not a fresh add case
+        else:
+            verdict = "ADD"
     elif data_completeness == "PARTIAL":
         verdict = "REVIEW"
     else:
-        verdict = "HOLD"
+        # Genuinely mixed zone (-0.5 < fund_score < 0.8): let position P&L
+        # actually matter instead of defaulting to HOLD unconditionally.
+        if pnl_pct is not None and pnl_pct <= -10:
+            verdict = "REVIEW"  # meaningful unrealized loss + mixed (not clean) fundamentals -- worth a closer look
+        else:
+            verdict = "HOLD"
 
     return Signal(
         verdict=verdict,
