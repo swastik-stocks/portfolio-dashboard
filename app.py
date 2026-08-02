@@ -129,16 +129,35 @@ with st.sidebar:
         submitted = col1.form_submit_button(submit_label, use_container_width=True)
         cancelled = col2.form_submit_button("Cancel", use_container_width=True) if editing else False
 
-        if submitted and symbol and qty > 0 and avg_price > 0:
-            if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
-                st.warning("Ticker should end in .NS (NSE) or .BO (BSE) — added .NS automatically.")
-                symbol = symbol + ".NS"
-            if editing:
-                update_holding(st.session_state.editing_id, symbol, company_name, account, qty, avg_price, notes)
-                st.session_state.editing_id = None
+        # ── P0-05 FIX ─────────────────────────────────────────────────
+        # Previously: `if submitted and symbol and qty > 0 and avg_price > 0:`
+        # with no else branch. If any condition failed (e.g. Quantity or
+        # Purchase Price left at their default 0.00), the form would
+        # silently no-op on every submit — page reruns, nothing saved,
+        # zero feedback. Looked exactly like a dead button. Now every
+        # failure path tells the user what's missing.
+        if submitted:
+            errors = []
+            if not symbol:
+                errors.append("NSE Ticker is required.")
+            if qty <= 0:
+                errors.append("Quantity must be greater than 0.")
+            if avg_price <= 0:
+                errors.append("Purchase Price must be greater than 0.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
             else:
-                add_holding(symbol, company_name, account, qty, avg_price, notes)
-            st.rerun()
+                if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
+                    st.warning("Ticker should end in .NS (NSE) or .BO (BSE) — added .NS automatically.")
+                    symbol = symbol + ".NS"
+                if editing:
+                    update_holding(st.session_state.editing_id, symbol, company_name, account, qty, avg_price, notes)
+                    st.session_state.editing_id = None
+                else:
+                    add_holding(symbol, company_name, account, qty, avg_price, notes)
+                st.rerun()
 
         if cancelled:
             st.session_state.editing_id = None
@@ -247,6 +266,10 @@ else:
 if view_mode.startswith("Consolidated"):
     rows = get_consolidated()
     df = build_view(rows, prices, signal_cache)
+    # P0-05 note: Edit/Delete controls only exist in "By Account" view
+    # below (per-lot actions need a single lot, not a cross-account
+    # blend). Surface that here so "Edit" doesn't look missing/dead.
+    st.caption("To edit or delete a specific holding, switch to \"By Account\" view above.")
 else:
     df = build_view(lots, prices, signal_cache)
 

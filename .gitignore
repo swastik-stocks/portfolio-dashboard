@@ -1,14 +1,30 @@
 # Secrets
 .env
 .streamlit/secrets.toml
+secrets.toml
 
 # Local database — contains real holdings/account data, never commit
+# portfolio.db is the plain local-mode file; portfolio_replica.db is
+# what db.py uses instead whenever TURSO_DATABASE_URL is set (embedded
+# replica mode). Both hold the same real data and must be ignored, along
+# with the -journal/-wal/-shm sidecar files SQLite creates for each.
 portfolio.db
 portfolio.db-journal
+portfolio.db-wal
+portfolio.db-shm
+portfolio_replica.db
+portfolio_replica.db-journal
+portfolio_replica.db-wal
+portfolio_replica.db-shm
 
 # Raw broker exports — sensitive PII (PAN, account numbers), never commit
 *.xlsx
 *.csv
+
+# Streamlit agent skills — environment-specific symlinks, auto-installed
+# locally by `streamlit run`, should not be committed
+.agents/skills/developing-with-streamlit
+.claude/skills/developing-with-streamlit
 
 # Python
 __pycache__/
@@ -19,3 +35,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+portfolio_replica.db-info
