@@ -20,7 +20,8 @@ from datetime import datetime
 
 from auth import check_password
 from db import (init_db, add_holding, update_holding, delete_holding, get_all_lots,
-                 get_consolidated, get_accounts, get_signal_cache, save_signal_cache)
+                 get_consolidated, get_accounts, get_signal_cache, save_signal_cache,
+                 get_scanner_signals)
 from price_fetcher import get_live_prices
 from deepseek_client import get_analysis, is_configured as deepseek_configured
 from signal_engine import VERDICT_COLOR
@@ -266,9 +267,6 @@ else:
 if view_mode.startswith("Consolidated"):
     rows = get_consolidated()
     df = build_view(rows, prices, signal_cache)
-    # P0-05 note: Edit/Delete controls only exist in "By Account" view
-    # below (per-lot actions need a single lot, not a cross-account
-    # blend). Surface that here so "Edit" doesn't look missing/dead.
     st.caption("To edit or delete a specific holding, switch to \"By Account\" view above.")
 else:
     df = build_view(lots, prices, signal_cache)
@@ -359,6 +357,53 @@ else:
             render_analysis_result(result, symbol=chosen["symbol"])
         else:
             st.error("Analysis unavailable — check DEEPSEEK_API_KEY in .env, or Screener.in fetch failed")
+
+# ── Scanner Signals (P1-05) — NSE Momentum's evening-scan picks, shown ───
+# alongside holdings so one screen answers both "what do I own" and
+# "what's worth looking at today." Read-only, best-effort: get_scanner_signals()
+# already returns [] on any failure (missing table, connection issue, etc.)
+# so this section simply doesn't render rather than breaking the dashboard.
+st.divider()
+st.subheader("🎯 Scanner Signals (NSE Momentum)")
+
+signals = get_scanner_signals()
+if not signals:
+    st.info("No scanner signals published yet — the evening scan runs Mon–Fri after market close "
+            "(NSE Momentum's daily_scan.yml). Check back after the next trading day.")
+else:
+    scan_date = signals[0].get("scan_date", "")
+    st.caption(f"From the {scan_date} evening scan — {len(signals)} signal(s), sorted by score. "
+               f"Not SEBI-registered investment advice.")
+
+    held_symbols = {lot["symbol"] for lot in lots}
+
+    signal_rows = []
+    for s in signals:
+        signal_rows.append({
+            "Owned": "✅" if s.get("ticker") in held_symbols else "",
+            "Ticker": s.get("ticker", ""),
+            "Pattern": s.get("pattern") or "",
+            "Score": s.get("total_score"),
+            "Tier": s.get("tier"),
+            "Confidence": f"{s['confidence_pct']:.0f}%" if s.get("confidence_pct") is not None else "—",
+            "Entry": s.get("entry_price"),
+            "Pivot": s.get("pivot"),
+            "Stop": s.get("stop_loss"),
+            "Target 1": s.get("target1"),
+            "Target 2": s.get("target2"),
+            "R:R": f"{s['rrr']:.1f}x" if s.get("rrr") is not None else "—",
+            "RS %ile": f"{s['rs_percentile']:.0f}th" if s.get("rs_percentile") is not None else "—",
+            "Regime": s.get("regime") or "",
+        })
+    signal_df = pd.DataFrame(signal_rows)
+    for money_col in ["Entry", "Pivot", "Stop", "Target 1", "Target 2"]:
+        signal_df[money_col] = signal_df[money_col].apply(lambda x: fmt_inr(x) if pd.notna(x) else "—")
+
+    st.dataframe(signal_df, use_container_width=True, hide_index=True)
+
+    owned_count = sum(1 for s in signals if s.get("ticker") in held_symbols)
+    if owned_count:
+        st.caption(f"✅ {owned_count} of these signals are for stocks you already own.")
 
 st.divider()
 st.caption(

@@ -6,18 +6,23 @@ CORRECTED VERSION: the previous version used the `libsql_client` package
 their free-tier infra to AWS — that's what caused the
 WSServerHandshakeError. This version uses Turso's current official
 `libsql` package instead, which uses the "Embedded Replicas" model:
-  - A local SQLite file (portfolio_replica.db) is kept in sync with
-    your remote Turso database.
-  - Writes go to the local file AND are pushed to the cloud primary.
-  - conn.sync() pulls any changes made elsewhere (e.g. via the Turso
-    dashboard's Edit Data tab) into the local replica.
+- A local SQLite file (portfolio_replica.db) is kept in sync with
+  your remote Turso database.
+- Writes go to the local file AND are pushed to the cloud primary.
+- conn.sync() pulls any changes made elsewhere (e.g. via the Turso
+  dashboard's Edit Data tab) into the local replica.
 
 Same design principle as before: ONE codebase, driven by env vars.
-  TURSO_DATABASE_URL + TURSO_AUTH_TOKEN set  -> embedded replica + Turso sync
-  neither set                                -> plain local file, no sync
+  TURSO_DATABASE_URL + TURSO_AUTH_TOKEN set -> embedded replica + Turso sync
+  neither set -> plain local file, no sync
 
 Each row is one LOT (one purchase, in one account) — NOT pre-consolidated.
 Consolidation across accounts happens at query time in get_consolidated().
+
+P1-05: get_scanner_signals() reads scanner_signals, published by
+NSE Momentum's daily_scan.yml via turso_sync.py (P1-03). Lives in the
+SAME Turso database as holdings — no new connection logic needed, just
+another query against the existing get_conn().
 """
 
 import os
@@ -31,10 +36,10 @@ try:
 except ImportError:
     pass
 
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_URL   = os.getenv("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
-LOCAL_DB_PATH = Path(__file__).parent / "portfolio.db"
+LOCAL_DB_PATH      = Path(__file__).parent / "portfolio.db"
 LOCAL_REPLICA_PATH = Path(__file__).parent / "portfolio_replica.db"
 
 
@@ -55,24 +60,24 @@ def init_db():
     conn = get_conn()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS holdings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            company_name TEXT,
-            account TEXT NOT NULL,
-            qty REAL NOT NULL,
-            avg_price REAL NOT NULL,
-            added_date TEXT,
-            notes TEXT
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol        TEXT NOT NULL,
+            company_name  TEXT,
+            account       TEXT NOT NULL,
+            qty           REAL NOT NULL,
+            avg_price     REAL NOT NULL,
+            added_date    TEXT,
+            notes         TEXT
         )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signal_cache (
-            symbol TEXT PRIMARY KEY,
-            verdict TEXT,
-            fundamental_score REAL,
-            news_sentiment INTEGER,
-            data_completeness TEXT,
-            computed_at TEXT
+            symbol             TEXT PRIMARY KEY,
+            verdict            TEXT,
+            fundamental_score  REAL,
+            news_sentiment     INTEGER,
+            data_completeness  TEXT,
+            computed_at        TEXT
         )
     """)
     conn.commit()
@@ -108,7 +113,7 @@ def save_signal_cache(symbol: str, verdict: str, fundamental_score: float,
 
 
 def add_holding(symbol: str, company_name: str, account: str, qty: float,
-                avg_price: float, notes: str = "") -> int:
+                 avg_price: float, notes: str = "") -> int:
     conn = get_conn()
     cursor = conn.execute("""
         INSERT INTO holdings (symbol, company_name, account, qty, avg_price, added_date, notes)
@@ -123,7 +128,7 @@ def add_holding(symbol: str, company_name: str, account: str, qty: float,
 
 
 def update_holding(holding_id: int, symbol: str, company_name: str, account: str,
-                   qty: float, avg_price: float, notes: str = ""):
+                    qty: float, avg_price: float, notes: str = ""):
     conn = get_conn()
     conn.execute("""
         UPDATE holdings
@@ -200,6 +205,36 @@ def get_consolidated() -> list:
             "num_accounts": len(set(entry["accounts"])),
         })
     return sorted(result, key=lambda x: x["symbol"])
+
+
+def get_scanner_signals(scan_date: str = None) -> list:
+    """
+    P1-05: read scanner signals published by NSE Momentum's evening scan.
+    Defaults to the most recent scan_date present in the table (there may
+    be a gap of days if the scan hasn't run — e.g. weekends — so "most
+    recent" is deliberately not "today"). Returns [] gracefully if the
+    table doesn't exist yet or the read fails for any reason — a bridge
+    read failure must never break the dashboard (same principle as
+    P1-06 on the NSE Momentum side).
+    """
+    try:
+        conn = get_conn()
+        if scan_date:
+            cursor = conn.execute(
+                "SELECT * FROM scanner_signals WHERE scan_date = ? ORDER BY total_score DESC",
+                (scan_date,)
+            )
+        else:
+            cursor = conn.execute("""
+                SELECT * FROM scanner_signals
+                WHERE scan_date = (SELECT MAX(scan_date) FROM scanner_signals)
+                ORDER BY total_score DESC
+            """)
+        result = _rows_to_dicts(cursor)
+        conn.close()
+        return result
+    except Exception:
+        return []
 
 
 if __name__ == "__main__":
