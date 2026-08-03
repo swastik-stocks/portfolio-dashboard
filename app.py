@@ -21,7 +21,7 @@ from datetime import datetime
 from auth import check_password
 from db import (init_db, add_holding, update_holding, delete_holding, get_all_lots,
                  get_consolidated, get_accounts, get_signal_cache, save_signal_cache,
-                 get_scanner_signals)
+                 get_scanner_signals, get_sector_breadth, get_ticker_sector_map)
 from price_fetcher import get_live_prices
 from deepseek_client import get_analysis, is_configured as deepseek_configured
 from signal_engine import VERDICT_COLOR
@@ -130,35 +130,16 @@ with st.sidebar:
         submitted = col1.form_submit_button(submit_label, use_container_width=True)
         cancelled = col2.form_submit_button("Cancel", use_container_width=True) if editing else False
 
-        # ── P0-05 FIX ─────────────────────────────────────────────────
-        # Previously: `if submitted and symbol and qty > 0 and avg_price > 0:`
-        # with no else branch. If any condition failed (e.g. Quantity or
-        # Purchase Price left at their default 0.00), the form would
-        # silently no-op on every submit — page reruns, nothing saved,
-        # zero feedback. Looked exactly like a dead button. Now every
-        # failure path tells the user what's missing.
-        if submitted:
-            errors = []
-            if not symbol:
-                errors.append("NSE Ticker is required.")
-            if qty <= 0:
-                errors.append("Quantity must be greater than 0.")
-            if avg_price <= 0:
-                errors.append("Purchase Price must be greater than 0.")
-
-            if errors:
-                for e in errors:
-                    st.error(e)
+        if submitted and symbol and qty > 0 and avg_price > 0:
+            if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
+                st.warning("Ticker should end in .NS (NSE) or .BO (BSE) — added .NS automatically.")
+                symbol = symbol + ".NS"
+            if editing:
+                update_holding(st.session_state.editing_id, symbol, company_name, account, qty, avg_price, notes)
+                st.session_state.editing_id = None
             else:
-                if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
-                    st.warning("Ticker should end in .NS (NSE) or .BO (BSE) — added .NS automatically.")
-                    symbol = symbol + ".NS"
-                if editing:
-                    update_holding(st.session_state.editing_id, symbol, company_name, account, qty, avg_price, notes)
-                    st.session_state.editing_id = None
-                else:
-                    add_holding(symbol, company_name, account, qty, avg_price, notes)
-                st.rerun()
+                add_holding(symbol, company_name, account, qty, avg_price, notes)
+            st.rerun()
 
         if cancelled:
             st.session_state.editing_id = None
@@ -404,6 +385,118 @@ else:
     owned_count = sum(1 for s in signals if s.get("ticker") in held_symbols)
     if owned_count:
         st.caption(f"✅ {owned_count} of these signals are for stocks you already own.")
+
+# ── Sector Rotation (P3-02) — count-based breadth grid from NSE Momentum's ──
+# sector_breadth.py (P3-01), read via the same Turso bridge as everything
+# else on this page. Color-scale grid via pandas Styler, matching the
+# "replicate the StockEdge breadth grid" goal from the backlog -- built on
+# a real, authoritative 20-sector taxonomy (NSE's own official Nifty 500
+# classification), not the older/messier nse_universe.py sector field.
+# get_sector_breadth() already returns [] on any failure -- this section
+# simply doesn't render rather than breaking the dashboard, same pattern
+# as the Scanner Signals section above.
+st.divider()
+st.subheader("🏭 Sector Rotation")
+
+breadth_rows = get_sector_breadth()
+if not breadth_rows:
+    st.info("No sector breadth data published yet — run sector_breadth.py on the NSE Momentum side "
+            "to compute and publish it.")
+else:
+    breadth_date_shown = breadth_rows[0].get("breadth_date", "")
+    st.caption(f"As of {breadth_date_shown} — % of stocks in each sector above SMA20/50/100, "
+               f"RSI(14)>50, and with a positive 55-day return. Count-based, not market-cap-weighted.")
+
+    breadth_df = pd.DataFrame([{
+        "Sector":       r.get("sector", ""),
+        "Stocks":       r.get("stock_count"),
+        "SMA20 %":      r.get("pct_above_sma20"),
+        "SMA50 %":      r.get("pct_above_sma50"),
+        "SMA100 %":     r.get("pct_above_sma100"),
+        "RSI50 %":      r.get("pct_above_rsi50"),
+        "RS55 %":       r.get("pct_above_rs55"),
+    } for r in breadth_rows])
+
+    pct_cols = ["SMA20 %", "SMA50 %", "SMA100 %", "RSI50 %", "RS55 %"]
+    styled_breadth = (
+        breadth_df.style
+        .background_gradient(cmap="RdYlGn", subset=pct_cols, vmin=0, vmax=100)
+        .format({col: "{:.1f}%" for col in pct_cols})
+    )
+    st.dataframe(styled_breadth, use_container_width=True, hide_index=True)
+
+# ── Sector Concentration (P3-08) — "are you unknowingly making one big ────
+# sector bet?" Cross-references actual holdings (get_consolidated, already
+# computed above) against the ticker->sector map and sector breadth just
+# published by NSE Momentum's sector_breadth.py. Both reads already return
+# [] / {} gracefully on any failure, so this section simply has nothing to
+# show rather than breaking the dashboard if either bridge read fails.
+# CONCENTRATION_THRESHOLD_PCT is a stated assumption (standard risk-
+# concentration heuristic), not derived from the backlog -- easy to adjust.
+CONCENTRATION_THRESHOLD_PCT = 25.0
+WEAK_SECTOR_SMA50_PCT = 50.0
+
+st.divider()
+st.subheader("⚖️ Sector Concentration")
+
+ticker_sector = get_ticker_sector_map()
+sector_breadth_rows = get_sector_breadth()
+consolidated_holdings = get_consolidated()
+
+if not ticker_sector or not consolidated_holdings:
+    st.info("Sector concentration check needs both your holdings and the ticker->sector map "
+            "from NSE Momentum's sector_breadth.py — one of these isn't available yet.")
+else:
+    sector_breadth_lookup = {r["sector"]: r for r in sector_breadth_rows}
+
+    sector_value = {}
+    total_value = 0.0
+    unmapped_tickers = []
+    for h in consolidated_holdings:
+        sector = ticker_sector.get(h["symbol"])
+        value = h.get("total_invested", h["qty"] * h["avg_price"])
+        total_value += value
+        if sector:
+            sector_value[sector] = sector_value.get(sector, 0.0) + value
+        else:
+            unmapped_tickers.append(h["symbol"])
+
+    if total_value > 0:
+        concentration_rows = []
+        for sector, value in sorted(sector_value.items(), key=lambda x: -x[1]):
+            pct_of_portfolio = value / total_value * 100
+            breadth = sector_breadth_lookup.get(sector)
+            sma50 = breadth.get("pct_above_sma50") if breadth else None
+            is_concentrated = pct_of_portfolio >= CONCENTRATION_THRESHOLD_PCT
+            is_weak = sma50 is not None and sma50 < WEAK_SECTOR_SMA50_PCT
+            flag = ""
+            if is_concentrated and is_weak:
+                flag = "🔴 Concentrated + weak sector"
+            elif is_concentrated:
+                flag = "🟡 Concentrated"
+            concentration_rows.append({
+                "Sector": sector,
+                "Invested": fmt_inr(value),
+                "% of Portfolio": f"{pct_of_portfolio:.1f}%",
+                "Sector SMA50 Breadth": f"{sma50:.1f}%" if sma50 is not None else "—",
+                "Flag": flag,
+            })
+
+        st.dataframe(pd.DataFrame(concentration_rows), use_container_width=True, hide_index=True)
+
+        flagged = [r for r in concentration_rows if r["Flag"]]
+        if flagged:
+            st.warning(f"⚠️ {len(flagged)} sector(s) flagged — you're concentrated "
+                       f"(≥{CONCENTRATION_THRESHOLD_PCT:.0f}% of portfolio) in at least one sector, "
+                       f"and for 🔴-flagged ones that sector's own breadth is currently weak "
+                       f"(<{WEAK_SECTOR_SMA50_PCT:.0f}% of its stocks above SMA50). Not advice — "
+                       f"just visibility into a concentration you may not have noticed.")
+        else:
+            st.caption(f"No sector currently exceeds {CONCENTRATION_THRESHOLD_PCT:.0f}% of your portfolio.")
+
+        if unmapped_tickers:
+            st.caption(f"Note: {len(unmapped_tickers)} held ticker(s) have no sector mapping yet "
+                       f"({', '.join(unmapped_tickers)}) — excluded from the percentages above.")
 
 st.divider()
 st.caption(

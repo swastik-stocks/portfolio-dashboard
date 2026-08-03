@@ -237,6 +237,53 @@ def get_scanner_signals(scan_date: str = None) -> list:
         return []
 
 
+def get_sector_breadth(breadth_date: str = None) -> list:
+    """
+    P3-02: read sector breadth published by NSE Momentum's sector_breadth.py
+    (P3-01), using the SAME Turso database as everything else here — no new
+    connection logic. Defaults to the most recent breadth_date present.
+    Returns [] gracefully on any failure, same principle as
+    get_scanner_signals() above (a bridge read must never break the
+    dashboard) and P1-06 on the NSE Momentum side.
+    """
+    try:
+        conn = get_conn()
+        if breadth_date:
+            cursor = conn.execute(
+                "SELECT * FROM sector_breadth WHERE breadth_date = ? ORDER BY pct_above_sma50 DESC",
+                (breadth_date,)
+            )
+        else:
+            cursor = conn.execute("""
+                SELECT * FROM sector_breadth
+                WHERE breadth_date = (SELECT MAX(breadth_date) FROM sector_breadth)
+                ORDER BY pct_above_sma50 DESC
+            """)
+        result = _rows_to_dicts(cursor)
+        conn.close()
+        return result
+    except Exception:
+        return []
+
+
+def get_ticker_sector_map() -> dict:
+    """
+    P3-08: read the ticker->sector mapping published by NSE Momentum's
+    sector_breadth.py, so holdings can be cross-referenced against sector
+    breadth without this repo needing its own copy of nse_universe.py or
+    the NSE constituent CSV. {ticker: sector}. Returns {} gracefully on any
+    failure -- same principle as every other bridge read in this file.
+    """
+    try:
+        conn = get_conn()
+        cursor = conn.execute("SELECT ticker, sector FROM ticker_sector_map")
+        result = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+        return result
+    except Exception:
+        return {}
+
+
 if __name__ == "__main__":
     init_db()
     mode = "Turso (embedded replica)" if TURSO_URL else f"local file ({LOCAL_DB_PATH})"
