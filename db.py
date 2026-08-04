@@ -317,3 +317,33 @@ if __name__ == "__main__":
     init_db()
     mode = "Turso (embedded replica)" if TURSO_URL else f"local file ({LOCAL_DB_PATH})"
     print(f"Initialized DB in {mode} mode")
+
+def get_holding_stops() -> dict:
+    """
+    P4-03: read the most recent technical stop per held ticker, published
+    by NSE Momentum's publish_holding_stops() (turso_sync.py). Returns
+    {ticker: {stop, method, action_date}} for dashboard Portfolio Heat
+    rendering. Returns {} gracefully on any failure.
+    """
+    try:
+        conn = get_conn()
+        cursor = conn.execute("""
+            SELECT ticker, new_stop, reason, action_date
+            FROM position_actions
+            WHERE action_type = 'HOLD_STOP'
+            AND action_date = (
+                SELECT MAX(action_date) FROM position_actions
+                WHERE action_type = 'HOLD_STOP'
+            )
+        """)
+        result = {}
+        for row in _rows_to_dicts(cursor):
+            result[row['ticker']] = {
+                'stop': row['new_stop'],
+                'method': row.get('reason', ''),
+                'action_date': row['action_date'],
+            }
+        conn.close()
+        return result
+    except Exception:
+        return {}
