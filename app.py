@@ -21,7 +21,8 @@ from datetime import datetime
 from auth import check_password
 from db import (init_db, add_holding, update_holding, delete_holding, get_all_lots,
                  get_consolidated, get_accounts, get_signal_cache, save_signal_cache,
-                 get_scanner_signals, get_sector_breadth, get_ticker_sector_map)
+                 get_scanner_signals, get_sector_breadth, get_ticker_sector_map,
+                 get_holding_stops, get_industry_breadth)
 from price_fetcher import get_live_prices
 from deepseek_client import get_analysis, is_configured as deepseek_configured
 from signal_engine import VERDICT_COLOR
@@ -267,6 +268,35 @@ m4.metric("Positions", len(df))
 
 st.divider()
 
+# ── P4-08: Dhan token status warning ─────────────────────────────────────
+# data_fetcher._check_dhan_auth() runs at scan start and publishes the
+# result to Turso's scanner_signals table's metadata field. We surface it
+# here so a stale token (24h SEBI-mandated expiry) is visible on the
+# dashboard before the next evening scan, not discovered after 500 tickers
+# have already fallen back to the slower Yahoo chain.
+# Reads from the most recent scanner signal's dhan_status field if present,
+# otherwise reads directly from the last scan log via a lightweight check.
+try:
+    _recent_signals = get_scanner_signals()
+    _dhan_ok = None
+    _dhan_msg = ""
+    if _recent_signals:
+        _dhan_ok = _recent_signals[0].get("dhan_available")
+        _dhan_msg = _recent_signals[0].get("dhan_message", "")
+    if _dhan_ok is False:
+        st.warning(
+            f"⚠️ **Dhan token invalid or expired** — last evening scan fell back to Yahoo Finance. "
+            f"Refresh your token at [web.dhan.co](https://web.dhan.co), then paste the new "
+            f"`DHAN_ACCESS_TOKEN` into `F:\\nse_momentum\\.env`. "
+            f"{'Details: ' + _dhan_msg if _dhan_msg else ''}"
+        )
+    elif _dhan_ok is True:
+        pass  # token valid — no banner needed, don't create noise
+    # _dhan_ok is None means the field isn't in scanner_signals yet (pre-P4-08
+    # schema) — silent, don't show a false alarm
+except Exception:
+    pass  # Dhan status check must never break the dashboard
+
 # ── Holdings table ────────────────────────────────────────────────────────
 display_df = df.copy()
 for col in ["Avg Price", "LTP", "Invested", "Current Value", "P&L"]:
@@ -386,37 +416,26 @@ else:
     if owned_count:
         st.caption(f"✅ {owned_count} of these signals are for stocks you already own.")
 
-# ── Sector Rotation (P3-02) — count-based breadth grid from NSE Momentum's ──
-# sector_breadth.py (P3-01), read via the same Turso bridge as everything
-# else on this page. Color-scale grid via pandas Styler, matching the
-# "replicate the StockEdge breadth grid" goal from the backlog -- built on
-# a real, authoritative 20-sector taxonomy (NSE's own official Nifty 500
-# classification), not the older/messier nse_universe.py sector field.
-# get_sector_breadth() already returns [] on any failure -- this section
-# simply doesn't render rather than breaking the dashboard, same pattern
-# as the Scanner Signals section above.
+# ── Sector Rotation (P3-02) ──────────────────────────────────────────────
 st.divider()
 st.subheader("🏭 Sector Rotation")
 
 breadth_rows = get_sector_breadth()
 if not breadth_rows:
-    st.info("No sector breadth data published yet — run sector_breadth.py on the NSE Momentum side "
-            "to compute and publish it.")
+    st.info("No sector breadth data published yet — run sector_breadth.py on the NSE Momentum side.")
 else:
     breadth_date_shown = breadth_rows[0].get("breadth_date", "")
     st.caption(f"As of {breadth_date_shown} — % of stocks in each sector above SMA20/50/100, "
                f"RSI(14)>50, and with a positive 55-day return. Count-based, not market-cap-weighted.")
-
     breadth_df = pd.DataFrame([{
-        "Sector":       r.get("sector", ""),
-        "Stocks":       r.get("stock_count"),
-        "SMA20 %":      r.get("pct_above_sma20"),
-        "SMA50 %":      r.get("pct_above_sma50"),
-        "SMA100 %":     r.get("pct_above_sma100"),
-        "RSI50 %":      r.get("pct_above_rsi50"),
-        "RS55 %":       r.get("pct_above_rs55"),
+        "Sector":    r.get("sector", ""),
+        "Stocks":    r.get("stock_count"),
+        "SMA20 %":   r.get("pct_above_sma20"),
+        "SMA50 %":   r.get("pct_above_sma50"),
+        "SMA100 %":  r.get("pct_above_sma100"),
+        "RSI50 %":   r.get("pct_above_rsi50"),
+        "RS55 %":    r.get("pct_above_rs55"),
     } for r in breadth_rows])
-
     pct_cols = ["SMA20 %", "SMA50 %", "SMA100 %", "RSI50 %", "RS55 %"]
     styled_breadth = (
         breadth_df.style
@@ -425,14 +444,7 @@ else:
     )
     st.dataframe(styled_breadth, use_container_width=True, hide_index=True)
 
-# ── Sector Concentration (P3-08) — "are you unknowingly making one big ────
-# sector bet?" Cross-references actual holdings (get_consolidated, already
-# computed above) against the ticker->sector map and sector breadth just
-# published by NSE Momentum's sector_breadth.py. Both reads already return
-# [] / {} gracefully on any failure, so this section simply has nothing to
-# show rather than breaking the dashboard if either bridge read fails.
-# CONCENTRATION_THRESHOLD_PCT is a stated assumption (standard risk-
-# concentration heuristic), not derived from the backlog -- easy to adjust.
+# ── Sector Concentration (P3-08) ─────────────────────────────────────────
 CONCENTRATION_THRESHOLD_PCT = 25.0
 WEAK_SECTOR_SMA50_PCT = 50.0
 
@@ -448,7 +460,6 @@ if not ticker_sector or not consolidated_holdings:
             "from NSE Momentum's sector_breadth.py — one of these isn't available yet.")
 else:
     sector_breadth_lookup = {r["sector"]: r for r in sector_breadth_rows}
-
     sector_value = {}
     total_value = 0.0
     unmapped_tickers = []
@@ -475,28 +486,142 @@ else:
             elif is_concentrated:
                 flag = "🟡 Concentrated"
             concentration_rows.append({
-                "Sector": sector,
-                "Invested": fmt_inr(value),
+                "Sector": sector, "Invested": fmt_inr(value),
                 "% of Portfolio": f"{pct_of_portfolio:.1f}%",
                 "Sector SMA50 Breadth": f"{sma50:.1f}%" if sma50 is not None else "—",
                 "Flag": flag,
             })
-
         st.dataframe(pd.DataFrame(concentration_rows), use_container_width=True, hide_index=True)
-
         flagged = [r for r in concentration_rows if r["Flag"]]
         if flagged:
-            st.warning(f"⚠️ {len(flagged)} sector(s) flagged — you're concentrated "
-                       f"(≥{CONCENTRATION_THRESHOLD_PCT:.0f}% of portfolio) in at least one sector, "
-                       f"and for 🔴-flagged ones that sector's own breadth is currently weak "
-                       f"(<{WEAK_SECTOR_SMA50_PCT:.0f}% of its stocks above SMA50). Not advice — "
-                       f"just visibility into a concentration you may not have noticed.")
+            st.warning(f"⚠️ {len(flagged)} sector(s) flagged — concentrated (≥{CONCENTRATION_THRESHOLD_PCT:.0f}%) "
+                       f"and/or in a weak sector (<{WEAK_SECTOR_SMA50_PCT:.0f}% above SMA50).")
         else:
             st.caption(f"No sector currently exceeds {CONCENTRATION_THRESHOLD_PCT:.0f}% of your portfolio.")
-
         if unmapped_tickers:
             st.caption(f"Note: {len(unmapped_tickers)} held ticker(s) have no sector mapping yet "
                        f"({', '.join(unmapped_tickers)}) — excluded from the percentages above.")
+
+# ── Portfolio Heat (P4-03) ────────────────────────────────────────────────
+# Total open risk = Σ(distance-to-stop × position_value) per held stock.
+# Stops are published nightly by NSE Momentum's scanner via
+# turso_sync.publish_holding_stops(), using the same compute_holding_stop()
+# methodology (EMA21/10D_LOW/ATR, per-tier capped) as P2-05's EXIT alerts.
+# Falls back gracefully to [] if the data isn't available yet (P1-06).
+st.divider()
+st.subheader("🌡️ Portfolio Heat")
+
+holding_stops = get_holding_stops()
+if not holding_stops:
+    st.info("No portfolio heat data yet — this populates after the next evening scan "
+            "(NSE Momentum's daily_scan.yml, Mon–Fri after market close).")
+else:
+    heat_date = next(iter(holding_stops.values())).get("action_date", "")
+    st.caption(f"As of {heat_date} evening scan. Heat = distance-to-stop × position value. "
+               f"Higher = more capital at risk if stop is hit. Not a sell signal — a sizing check.")
+
+    heat_rows = []
+    total_heat = 0.0
+    total_portfolio_value = 0.0
+
+    for h in consolidated_holdings:
+        ticker = h["symbol"]
+        stop_data = holding_stops.get(ticker)
+        ltp = prices.get(ticker)
+        position_value = ltp * h["qty"] if ltp else h["qty"] * h["avg_price"]
+        total_portfolio_value += position_value
+
+        if stop_data and ltp:
+            stop = stop_data["stop"]
+            distance_pct = (ltp - stop) / ltp * 100 if ltp > 0 else 0.0
+            heat_inr = max(0.0, (ltp - stop) * h["qty"])
+            total_heat += heat_inr
+            heat_rows.append({
+                "Ticker":         ticker,
+                "LTP":            fmt_inr(ltp),
+                "Stop":           fmt_inr(stop),
+                "Stop Method":    stop_data.get("method", ""),
+                "Distance %":     f"{distance_pct:.1f}%",
+                "Position Value": fmt_inr(position_value),
+                "Heat (₹ at risk)": fmt_inr(heat_inr),
+            })
+        else:
+            heat_rows.append({
+                "Ticker":         ticker,
+                "LTP":            fmt_inr(ltp) if ltp else "—",
+                "Stop":           "—",
+                "Stop Method":    "—",
+                "Distance %":     "—",
+                "Position Value": fmt_inr(position_value),
+                "Heat (₹ at risk)": "—",
+            })
+
+    heat_rows.sort(key=lambda x: float(x["Heat (₹ at risk)"].replace("₹","").replace(",",""))
+                   if x["Heat (₹ at risk)"] != "—" else 0, reverse=True)
+    st.dataframe(pd.DataFrame(heat_rows), use_container_width=True, hide_index=True)
+
+    heat_pct = (total_heat / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
+    col_h1, col_h2 = st.columns(2)
+    col_h1.metric("Total Portfolio Heat", fmt_inr(total_heat),
+                  help="Total ₹ at risk if every held position hits its stop simultaneously")
+    col_h2.metric("Heat as % of Portfolio", f"{heat_pct:.1f}%",
+                  help="Standard risk-management rule of thumb: keep total heat below 5-10% of capital")
+    if heat_pct > 10:
+        st.warning(f"⚠️ Total portfolio heat is {heat_pct:.1f}% of estimated portfolio value — "
+                   f"above the typical 10% guideline. Consider reducing position sizes or tightening stops.")
+
+# ── Industry Breadth (P3-04) ─────────────────────────────────────────────
+# 138-industry granularity, same breadth flags as Sector Rotation (P3-02)
+# but at Screener.in's 4-level taxonomy (broad_sector/sector/broad_industry/
+# industry). Useful for drilling below a sector-level signal — e.g. "Capital
+# Goods breadth is weak" -> which sub-industries are leading vs lagging?
+# Published by NSE Momentum's industry_breadth.py (P3-04).
+st.divider()
+st.subheader("🏗️ Industry Breadth (138-industry)")
+
+industry_rows = get_industry_breadth()
+if not industry_rows:
+    st.info("No industry breadth data published yet — run industry_breadth.py on the NSE Momentum side.")
+else:
+    ind_date_shown = industry_rows[0].get("breadth_date", "")
+    st.caption(
+        f"As of {ind_date_shown} — same breadth flags as Sector Rotation but at 138-industry "
+        f"granularity (Screener.in taxonomy). Sorted by SMA50 breadth descending. "
+        f"Low-count industries (≤2 stocks) shown but less statistically meaningful."
+    )
+
+    # Search/filter box — 138 rows is too many to scroll without it
+    ind_search = st.text_input(
+        "Filter by industry name", placeholder="e.g. Pharma, Bank, Auto...",
+        key="industry_search"
+    ).strip().lower()
+
+    industry_df = pd.DataFrame([{
+        "Industry":   r.get("industry", ""),
+        "Stocks":     r.get("stock_count"),
+        "SMA20 %":    r.get("pct_above_sma20"),
+        "SMA50 %":    r.get("pct_above_sma50"),
+        "SMA100 %":   r.get("pct_above_sma100"),
+        "RSI50 %":    r.get("pct_above_rsi50"),
+        "RS55 %":     r.get("pct_above_rs55"),
+    } for r in industry_rows])
+
+    if ind_search:
+        industry_df = industry_df[
+            industry_df["Industry"].str.lower().str.contains(ind_search, na=False)
+        ]
+        if industry_df.empty:
+            st.caption(f"No industries matching '{ind_search}'.")
+
+    if not industry_df.empty:
+        ind_pct_cols = ["SMA20 %", "SMA50 %", "SMA100 %", "RSI50 %", "RS55 %"]
+        styled_ind = (
+            industry_df.style
+            .background_gradient(cmap="RdYlGn", subset=ind_pct_cols, vmin=0, vmax=100)
+            .format({col: "{:.1f}%" for col in ind_pct_cols})
+        )
+        st.dataframe(styled_ind, use_container_width=True, hide_index=True)
+        st.caption(f"Showing {len(industry_df)} of {len(industry_rows)} industries.")
 
 st.divider()
 st.caption(

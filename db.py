@@ -266,6 +266,35 @@ def get_sector_breadth(breadth_date: str = None) -> list:
         return []
 
 
+def get_industry_breadth(breadth_date: str = None) -> list:
+    """
+    P3-04: read industry breadth published by NSE Momentum's industry_breadth.py,
+    same Turso database, same pattern as get_sector_breadth() above — just the
+    138-industry granularity table instead of the 20-sector one. Defaults to
+    the most recent breadth_date. Returns [] gracefully on any failure — a
+    missing industry_breadth table (e.g. before industry_breadth.py has run
+    for the first time) must never break the dashboard.
+    """
+    try:
+        conn = get_conn()
+        if breadth_date:
+            cursor = conn.execute(
+                "SELECT * FROM industry_breadth WHERE breadth_date = ? ORDER BY pct_above_sma50 DESC",
+                (breadth_date,)
+            )
+        else:
+            cursor = conn.execute("""
+                SELECT * FROM industry_breadth
+                WHERE breadth_date = (SELECT MAX(breadth_date) FROM industry_breadth)
+                ORDER BY pct_above_sma50 DESC
+            """)
+        result = _rows_to_dicts(cursor)
+        conn.close()
+        return result
+    except Exception:
+        return []
+
+
 def get_ticker_sector_map() -> dict:
     """
     P3-08: read the ticker->sector mapping published by NSE Momentum's
