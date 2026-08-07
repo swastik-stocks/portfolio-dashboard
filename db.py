@@ -80,9 +80,32 @@ def init_db():
             computed_at        TEXT
         )
     """)
+    _migrate_holdings_columns(conn)
     conn.commit()
     _sync_if_remote(conn)
     conn.close()
+
+
+def _migrate_holdings_columns(conn):
+    """
+    P1-06: holdings didn't originally track HOW a symbol was resolved at
+    entry time (see app.py's entry-time resolution flow). Extends the
+    existing table rather than a new one — same check-before-ALTER pattern
+    NSE Momentum's turso_sync.migrate_position_actions_columns() uses,
+    since SQLite has no "ADD COLUMN IF NOT EXISTS". One of RESOLVED_EXACT /
+    RESOLVED_FUZZY_ACCEPTED / UNVERIFIED_OVERRIDE / None (rows written
+    before this migration).
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(holdings)").fetchall()}
+    if "resolution_status" not in existing:
+        conn.execute("ALTER TABLE holdings ADD COLUMN resolution_status TEXT")
+
+    # P1-08: signal_cache needs a real reason a symbol has no verdict yet,
+    # replacing the single generic "(not run)" label that covered "never
+    # refreshed", "fetch failed", and "no fundamentals data" identically.
+    existing_sc = {row[1] for row in conn.execute("PRAGMA table_info(signal_cache)").fetchall()}
+    if "reason_code" not in existing_sc:
+        conn.execute("ALTER TABLE signal_cache ADD COLUMN reason_code TEXT")
 
 
 def get_signal_cache() -> dict:
@@ -95,31 +118,33 @@ def get_signal_cache() -> dict:
 
 
 def save_signal_cache(symbol: str, verdict: str, fundamental_score: float,
-                       news_sentiment: int, data_completeness: str, computed_at: str):
+                       news_sentiment: int, data_completeness: str, computed_at: str,
+                       reason_code: str = "OK"):
     conn = get_conn()
     conn.execute("""
-        INSERT INTO signal_cache (symbol, verdict, fundamental_score, news_sentiment, data_completeness, computed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO signal_cache (symbol, verdict, fundamental_score, news_sentiment, data_completeness, computed_at, reason_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             verdict=excluded.verdict,
             fundamental_score=excluded.fundamental_score,
             news_sentiment=excluded.news_sentiment,
             data_completeness=excluded.data_completeness,
-            computed_at=excluded.computed_at
-    """, (symbol, verdict, fundamental_score, news_sentiment, data_completeness, computed_at))
+            computed_at=excluded.computed_at,
+            reason_code=excluded.reason_code
+    """, (symbol, verdict, fundamental_score, news_sentiment, data_completeness, computed_at, reason_code))
     conn.commit()
     _sync_if_remote(conn)
     conn.close()
 
 
 def add_holding(symbol: str, company_name: str, account: str, qty: float,
-                 avg_price: float, notes: str = "") -> int:
+                 avg_price: float, notes: str = "", resolution_status: str = None) -> int:
     conn = get_conn()
     cursor = conn.execute("""
-        INSERT INTO holdings (symbol, company_name, account, qty, avg_price, added_date, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO holdings (symbol, company_name, account, qty, avg_price, added_date, notes, resolution_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (symbol.strip().upper(), company_name.strip(), account.strip(),
-          qty, avg_price, date.today().isoformat(), notes))
+          qty, avg_price, date.today().isoformat(), notes, resolution_status))
     conn.commit()
     new_id = cursor.lastrowid
     _sync_if_remote(conn)
@@ -128,14 +153,14 @@ def add_holding(symbol: str, company_name: str, account: str, qty: float,
 
 
 def update_holding(holding_id: int, symbol: str, company_name: str, account: str,
-                    qty: float, avg_price: float, notes: str = ""):
+                    qty: float, avg_price: float, notes: str = "", resolution_status: str = None):
     conn = get_conn()
     conn.execute("""
         UPDATE holdings
-        SET symbol=?, company_name=?, account=?, qty=?, avg_price=?, notes=?
+        SET symbol=?, company_name=?, account=?, qty=?, avg_price=?, notes=?, resolution_status=?
         WHERE id=?
     """, (symbol.strip().upper(), company_name.strip(), account.strip(),
-          qty, avg_price, notes, holding_id))
+          qty, avg_price, notes, resolution_status, holding_id))
     conn.commit()
     _sync_if_remote(conn)
     conn.close()
@@ -186,6 +211,14 @@ def get_consolidated() -> list:
                 "qty": 0.0,
                 "total_invested": 0.0,
                 "accounts": [],
+                # P1-08: carry resolution_status through so the dashboard can
+                # flag a symbol that was saved unverified, independent of
+                # whatever the signal_cache reason_code says. If lots of the
+                # same symbol somehow have different statuses (shouldn't
+                # normally happen — same symbol implies same resolution),
+                # the first lot's value wins; consolidated view doesn't need
+                # per-lot granularity here.
+                "resolution_status": lot.get("resolution_status"),
             }
         entry = by_symbol[sym]
         entry["qty"] += lot["qty"]
@@ -203,6 +236,7 @@ def get_consolidated() -> list:
             "total_invested": entry["total_invested"],
             "accounts": sorted(set(entry["accounts"])),
             "num_accounts": len(set(entry["accounts"])),
+            "resolution_status": entry["resolution_status"],
         })
     return sorted(result, key=lambda x: x["symbol"])
 

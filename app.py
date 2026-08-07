@@ -27,6 +27,7 @@ from price_fetcher import get_live_prices
 from deepseek_client import get_analysis, is_configured as deepseek_configured
 from signal_engine import VERDICT_COLOR
 from quick_signal import compute_quick_signal
+from symbol_check import resolve_against_master
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
@@ -38,6 +39,11 @@ init_db()
 # ── Session state ────────────────────────────────────────────────────────
 if "editing_id" not in st.session_state:
     st.session_state.editing_id = None
+# P1-06: holds the submitted-but-not-yet-resolved form values while the
+# entry-time resolution confirmation panel is shown (see sidebar below).
+# None means "no pending confirmation, show the normal form."
+if "pending_holding" not in st.session_state:
+    st.session_state.pending_holding = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -58,6 +64,28 @@ VERDICT_EMOJI = {
     "REVIEW": "⚪ REVIEW",
 }
 
+# P1-08: real reason codes replacing the single generic "(not run)" label —
+# see quick_signal.compute_quick_signal()'s docstring for what produces each.
+# NOT_YET_REFRESHED covers the one case that's genuinely just "hasn't been
+# clicked yet," not a failure — everything else means a refresh WAS
+# attempted and something specific kept it from producing a verdict.
+REASON_LABELS = {
+    "NOT_YET_REFRESHED": "— (not yet refreshed)",
+    "NO_DATA": "⚪ NO DATA",
+    "FETCH_ERROR": "🔴 FETCH ERROR",
+}
+
+# P1-06: resolution_status values that mean "this symbol was saved without
+# being verified against the NSE master" — surfaced independently of the
+# signal reason code, since a bad symbol and a failed fetch are different
+# problems (a bad symbol will usually ALSO show NO_DATA/FETCH_ERROR, but
+# knowing WHY matters — see entry-time resolution flow in the sidebar form).
+# Deliberately does NOT include None: rows written before this migration
+# (or the backfill in backfill_holdings_symbols.py) have resolution_status
+# = None but are not necessarily unverified — flagging every pre-migration
+# row would bury the genuinely-unverified ones in noise.
+UNVERIFIED_RESOLUTION_STATUSES = {"UNVERIFIED_OVERRIDE"}
+
 
 def build_view(rows: list, prices: dict, signal_cache: dict = None) -> pd.DataFrame:
     signal_cache = signal_cache or {}
@@ -70,12 +98,24 @@ def build_view(rows: list, prices: dict, signal_cache: dict = None) -> pd.DataFr
         pnl_pct = (pnl / invested * 100) if pnl is not None and invested else None
 
         cached = signal_cache.get(r["symbol"])
-        signal_display = VERDICT_EMOJI.get(cached["verdict"], "—") if cached else "— (not run)"
+        if cached:
+            reason_code = cached.get("reason_code") or "OK"
+            signal_display = (VERDICT_EMOJI.get(cached["verdict"], "—") if reason_code == "OK"
+                              else REASON_LABELS.get(reason_code, VERDICT_EMOJI.get(cached["verdict"], "—")))
+        else:
+            signal_display = REASON_LABELS["NOT_YET_REFRESHED"]
+
+        # Rows written before this migration have resolution_status=None,
+        # same as a genuinely unverified save — both correctly show the flag
+        # rather than silently assuming pre-migration rows are fine.
+        symbol_display = r["symbol"]
+        if r.get("resolution_status") in UNVERIFIED_RESOLUTION_STATUSES:
+            symbol_display = f"⚠️ {r['symbol']}"
 
         out.append({
             "id": r.get("id"),
             "Signal": signal_display,
-            "Symbol": r["symbol"],
+            "Symbol": symbol_display,
             "Name": r.get("company_name", ""),
             "Account(s)": ", ".join(r["accounts"]) if "accounts" in r else r.get("account", ""),
             "Qty": r["qty"],
@@ -89,6 +129,42 @@ def build_view(rows: list, prices: dict, signal_cache: dict = None) -> pd.DataFr
     return pd.DataFrame(out)
 
 
+def _save_pending(pending: dict, resolved_symbol: str, resolution_status: str) -> None:
+    """
+    P1-06: actually writes a holding (add or update) using whatever symbol
+    was decided in the confirmation panel, then clears pending state and
+    reruns. Centralized here so both the "use suggestion" and "keep as
+    typed"/"save anyway" buttons share one write path.
+
+    resolved_symbol may be BARE (resolve_against_master() queries
+    nse_symbol_master, which stores symbols without an exchange suffix) —
+    re-attach whatever suffix the user's original input had (default .NS)
+    so the stored value keeps this app's established TICKER.NS convention.
+    Same bug class caught in backfill_holdings_symbols.py: without this,
+    accepting a fuzzy suggestion would silently strip .NS off the saved
+    symbol, breaking price_fetcher.py's .NS assumption downstream.
+    """
+    suffix = ".NS"
+    for suf in (".NS", ".BO"):
+        if pending["symbol"].upper().endswith(suf):
+            suffix = suf
+            break
+    if not resolved_symbol.upper().endswith((".NS", ".BO")):
+        resolved_symbol = resolved_symbol + suffix
+
+    if pending["editing_id"] is not None:
+        update_holding(pending["editing_id"], resolved_symbol, pending["company_name"],
+                       pending["account"], pending["qty"], pending["avg_price"],
+                       pending["notes"], resolution_status=resolution_status)
+        st.session_state.editing_id = None
+    else:
+        add_holding(resolved_symbol, pending["company_name"], pending["account"],
+                   pending["qty"], pending["avg_price"], pending["notes"],
+                   resolution_status=resolution_status)
+    st.session_state.pending_holding = None
+    st.rerun()
+
+
 # ── Sidebar: Add / Edit holding ──────────────────────────────────────────
 with st.sidebar:
     if st.button("🔓 Log out"):
@@ -100,51 +176,117 @@ with st.sidebar:
     editing = st.session_state.editing_id is not None
     lots = get_all_lots()
     edit_row = next((l for l in lots if l["id"] == st.session_state.editing_id), None) if editing else None
+    pending = st.session_state.pending_holding
 
-    with st.form("holding_form", clear_on_submit=not editing):
-        symbol = st.text_input(
-            "NSE Ticker (e.g. RELIANCE.NS)",
-            value=edit_row["symbol"] if edit_row else "",
-        ).strip().upper()
-        company_name = st.text_input(
-            "Company Name",
-            value=edit_row["company_name"] if edit_row else "",
-        )
-        account = st.text_input(
-            "Account tag (e.g. AXIS, YES, DHAN)",
-            value=edit_row["account"] if edit_row else "",
-        )
-        qty = st.number_input(
-            "Quantity",
-            min_value=0.0, step=1.0,
-            value=float(edit_row["qty"]) if edit_row else 0.0,
-        )
-        avg_price = st.number_input(
-            "Purchase Price (per share)",
-            min_value=0.0, step=0.01, format="%.2f",
-            value=float(edit_row["avg_price"]) if edit_row else 0.0,
-        )
-        notes = st.text_input("Notes (optional)", value=edit_row["notes"] if edit_row else "")
+    if pending:
+        # P1-06: confirmation panel, shown INSTEAD of the entry form while a
+        # submitted symbol didn't resolve exactly against nse_symbol_master.
+        # Soft block, not a hard block: nothing is written to holdings until
+        # one of these buttons is clicked — a brand-new listing the NSE
+        # master hasn't caught up on yet is a legitimate reason to override,
+        # not just a typo, so we warn and require confirmation rather than
+        # refuse the save outright.
+        res = pending["resolution"]
+        st.warning(f"Could not confirm **{pending['symbol']}** against NSE listings.")
 
-        col1, col2 = st.columns(2)
-        submit_label = "Update Holding" if editing else "Add Holding"
-        submitted = col1.form_submit_button(submit_label, use_container_width=True)
-        cancelled = col2.form_submit_button("Cancel", use_container_width=True) if editing else False
+        if res["status"] in ("FUZZY_NAME", "AMBIGUOUS_FUZZY"):
+            ambiguous_note = (" *(a close alternative also matched — double-check this is right)*"
+                              if res["status"] == "AMBIGUOUS_FUZZY" else "")
+            st.write(f"Did you mean **{res['symbol']}** — {res['company_name']}?{ambiguous_note}")
+            c1, c2 = st.columns(2)
+            if c1.button(f"Use {res['symbol']}", use_container_width=True):
+                _save_pending(pending, res["symbol"], "RESOLVED_FUZZY_ACCEPTED")
+            if c2.button(f"Keep {pending['symbol']}", use_container_width=True):
+                _save_pending(pending, pending["symbol"], "UNVERIFIED_OVERRIDE")
+        else:
+            st.write("No matching NSE symbol or company name found.")
+            verified = st.checkbox("I've verified this ticker manually")
+            if st.button("Save anyway", disabled=not verified, use_container_width=True):
+                _save_pending(pending, pending["symbol"], "UNVERIFIED_OVERRIDE")
 
-        if submitted and symbol and qty > 0 and avg_price > 0:
-            if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
-                st.warning("Ticker should end in .NS (NSE) or .BO (BSE) — added .NS automatically.")
-                symbol = symbol + ".NS"
-            if editing:
-                update_holding(st.session_state.editing_id, symbol, company_name, account, qty, avg_price, notes)
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.pending_holding = None
+            st.rerun()
+
+    else:
+        with st.form("holding_form", clear_on_submit=not editing):
+            symbol = st.text_input(
+                "NSE Ticker (e.g. RELIANCE.NS)",
+                value=edit_row["symbol"] if edit_row else "",
+            ).strip().upper()
+            company_name = st.text_input(
+                "Company Name",
+                value=edit_row["company_name"] if edit_row else "",
+            )
+            account = st.text_input(
+                "Account tag (e.g. AXIS, YES, DHAN)",
+                value=edit_row["account"] if edit_row else "",
+            )
+            qty = st.number_input(
+                "Quantity",
+                min_value=0.0, step=1.0,
+                value=float(edit_row["qty"]) if edit_row else 0.0,
+            )
+            avg_price = st.number_input(
+                "Purchase Price (per share)",
+                min_value=0.0, step=0.01, format="%.2f",
+                value=float(edit_row["avg_price"]) if edit_row else 0.0,
+            )
+            notes = st.text_input("Notes (optional)", value=edit_row["notes"] if edit_row else "")
+
+            col1, col2 = st.columns(2)
+            submit_label = "Update Holding" if editing else "Add Holding"
+            submitted = col1.form_submit_button(submit_label, use_container_width=True)
+            cancelled = col2.form_submit_button("Cancel", use_container_width=True) if editing else False
+
+            if submitted and symbol and qty > 0 and avg_price > 0:
+                if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
+                    st.warning("Ticker should end in .NS (NSE) or .BO (BSE) — added .NS automatically.")
+                    symbol = symbol + ".NS"
+
+                # P1-06: resolve against the shared NSE symbol master before
+                # writing anything. Try the bare symbol first (strip the
+                # exchange suffix nse_symbol_master doesn't store), then fall
+                # back to the typed company name if the symbol itself didn't
+                # match — same "prefer the more specific signal" order as
+                # backfill_holdings_symbols.py.
+                bare = symbol[:-3] if symbol.endswith((".NS", ".BO")) else symbol
+                resolution = resolve_against_master(bare)
+                if resolution["status"] == "UNRESOLVED" and company_name.strip():
+                    resolution = resolve_against_master(company_name)
+
+                if resolution["status"] == "EXACT_SYMBOL":
+                    if editing:
+                        update_holding(st.session_state.editing_id, symbol, company_name, account,
+                                       qty, avg_price, notes, resolution_status="RESOLVED_EXACT")
+                        st.session_state.editing_id = None
+                    else:
+                        add_holding(symbol, company_name, account, qty, avg_price, notes,
+                                   resolution_status="RESOLVED_EXACT")
+                    st.rerun()
+                elif resolution["status"] == "UNAVAILABLE":
+                    # nse_symbol_master unreachable/empty — fail open, don't
+                    # block entry on our own infra issue. resolution_status
+                    # stays None (unknown, not flagged as unverified).
+                    if editing:
+                        update_holding(st.session_state.editing_id, symbol, company_name, account,
+                                       qty, avg_price, notes)
+                        st.session_state.editing_id = None
+                    else:
+                        add_holding(symbol, company_name, account, qty, avg_price, notes)
+                    st.rerun()
+                else:
+                    st.session_state.pending_holding = {
+                        "symbol": symbol, "company_name": company_name, "account": account,
+                        "qty": qty, "avg_price": avg_price, "notes": notes,
+                        "editing_id": st.session_state.editing_id if editing else None,
+                        "resolution": resolution,
+                    }
+                    st.rerun()
+
+            if cancelled:
                 st.session_state.editing_id = None
-            else:
-                add_holding(symbol, company_name, account, qty, avg_price, notes)
-            st.rerun()
-
-        if cancelled:
-            st.session_state.editing_id = None
-            st.rerun()
+                st.rerun()
 
     st.divider()
     st.caption(
@@ -229,10 +371,14 @@ if refresh_signals_clicked:
                     "pnl": pnl, "pnl_pct": pnl_pct}
         progress.progress((i) / len(consolidated_for_signals),
                           text=f"Refreshing signals... {symbol} ({i+1}/{len(consolidated_for_signals)})")
-        sig = compute_quick_signal(symbol, r["company_name"], position=position)
+        # P1-08: compute_quick_signal is exception-safe and always returns a
+        # (signal, reason_code) pair now — one bad symbol degrades to a
+        # labeled FETCH_ERROR row instead of crashing this whole loop and
+        # leaving every symbol after it stuck at "(not run)".
+        sig, reason_code = compute_quick_signal(symbol, r["company_name"], position=position)
         save_signal_cache(symbol, sig.verdict, sig.fundamental_score,
                           sig.news_sentiment, sig.data_completeness,
-                          datetime.now().isoformat())
+                          datetime.now().isoformat(), reason_code=reason_code)
     progress.progress(1.0, text="Signals refreshed.")
     st.rerun()
 

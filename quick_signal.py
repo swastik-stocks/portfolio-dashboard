@@ -18,19 +18,60 @@ to be triggered manually (a "Refresh Signals" button), not on every
 page render.
 """
 
+import logging
+
 from fundamentals import fetch_fundamentals
 from red_flags import evaluate
 from news_fetcher import fetch_news
 from signal_engine import compute_signal, Signal
 
+log = logging.getLogger(__name__)
 
-def compute_quick_signal(symbol: str, company_name: str, position: dict = None) -> Signal:
+
+def compute_quick_signal(symbol: str, company_name: str, position: dict = None) -> tuple:
     """
     Same inputs/logic as deepseek_client.get_analysis(), minus the
-    DeepSeek call. Returns a Signal object (see signal_engine.py) --
-    verdict, fundamental_score, news_sentiment, data_completeness.
+    DeepSeek call.
+
+    Returns (Signal, reason_code) — reason_code is one of:
+      OK        — fundamentals fetched normally, real verdict computed
+      NO_DATA   — fetch succeeded but returned nothing usable (<=3 fields;
+                  same threshold red_flags.evaluate() already gates on)
+      FETCH_ERROR — fetch_fundamentals/fetch_news raised
+
+    P1-08: previously any exception here propagated straight out of this
+    function, which meant app.py's Refresh Signals loop (no try/except of
+    its own) would crash on the FIRST bad symbol and leave every symbol
+    after it in iteration order stuck showing "(not run)" — not just the
+    one that actually failed. Catching here means one bad symbol degrades
+    to a labeled FETCH_ERROR row instead of silently blocking the whole
+    portfolio's refresh.
     """
-    fundamentals = fetch_fundamentals(symbol) or {}
+    try:
+        fundamentals = fetch_fundamentals(symbol) or {}
+    except Exception as e:
+        log.warning(f"fetch_fundamentals failed for {symbol}: {e}")
+        fundamentals = {}
+        fetch_failed = True
+    else:
+        fetch_failed = False
+
     flags = evaluate(fundamentals) if len(fundamentals) > 3 else []
-    news = fetch_news(company_name, symbol) or []
-    return compute_signal(flags, fundamentals, news, position or {})
+
+    try:
+        news = fetch_news(company_name, symbol) or []
+    except Exception as e:
+        log.warning(f"fetch_news failed for {symbol}: {e}")
+        news = []
+        fetch_failed = True
+
+    signal = compute_signal(flags, fundamentals, news, position or {})
+
+    if fetch_failed:
+        reason_code = "FETCH_ERROR"
+    elif len(fundamentals) <= 3:
+        reason_code = "NO_DATA"
+    else:
+        reason_code = "OK"
+
+    return signal, reason_code
