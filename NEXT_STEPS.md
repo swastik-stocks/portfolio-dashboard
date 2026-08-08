@@ -8,17 +8,22 @@ sidebar entry-time resolution flow for what shipped. Companion doc in
 
 ## Pending
 
-1. **Optional — cosmetic**: `company_name` for the two backfilled holdings
-   in Turso's `holdings` table (id 22, 23) still reads "ASTER DM QUALITY
-   CARE" / "SAI LIFE SCIENCES" instead of their real NSE names ("Aster DM
-   Quality Care Limited" / "Sai Life Sciences Limited"). Display-only field,
-   never affected anything functionally — low priority.
-
-2. **Delete the `libsql` line from `requirements.txt`'s installed venv**
+1. **Delete the `libsql` line from `requirements.txt`'s installed venv**
    if you ever prune dependencies — it's no longer imported anywhere, only
    removed from `requirements.txt`, not uninstalled from `venv/`.
 
+2. **Not this repo's fix, but affects a feature here**: nse_momentum's
+   `turso_sync.publish_holding_stops()` is defined but never called
+   anywhere — dead code. It's what's supposed to feed this app's
+   `get_holding_stops()` / "Portfolio Heat" feature via `position_actions`
+   `HOLD_STOP` rows, so that feature has never had real data. Tracked in
+   nse_momentum's `NEXT_STEPS.md`; needs a decision there on whether to
+   wire it in or remove it.
+
 ## Done (2026-08-08)
+
+- **Cosmetic `company_name` fix** — the two backfilled holdings (id 22, 23)
+  now show their real NSE names in the shared Turso `holdings` table.
 
 - **`libsql` → `libsql_client` migration** — `db.py` rewritten behind a
   small `_LocalConn`/`_TursoConn` adapter (stdlib `sqlite3` for local-only
